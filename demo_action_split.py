@@ -1,14 +1,4 @@
-import os
-import numpy as np
-from vision_agent.tools import *
-from vision_agent.tools.planner_tools import judge_od_results
-from typing import *
-from pillow_heif import register_heif_opener
-register_heif_opener()
-import vision_agent as va
-from vision_agent.tools import register_tool
-import cv2
-from datetime import datetime
+
 
 def process_tennis_video(video_path: str) -> dict:
     """
@@ -33,13 +23,22 @@ def process_tennis_video(video_path: str) -> dict:
             "stroke_video": str
         }
     """
-
-    from vision_agent.tools import extract_frames_and_timestamps, save_image, save_video, overlay_bounding_boxes
-    # 使用更精确的对象检测和跟踪工具
-    from vision_agent.tools import owlv2_sam2_video_tracking
-
+    import os
     import math
-    
+    import cv2
+    from datetime import datetime
+    from pillow_heif import register_heif_opener
+    import vision_agent as va
+    from vision_agent.tools import (
+        extract_frames_and_timestamps,
+        save_image,
+        save_video,
+        overlay_bounding_boxes,
+        owlv2_sam2_video_tracking
+    )
+
+    register_heif_opener()
+
     # 创建唯一的输出目录
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     video_name = os.path.basename(video_path).split('.')[0]
