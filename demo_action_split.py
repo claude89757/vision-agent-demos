@@ -1,3 +1,37 @@
+import os
+from contextlib import contextmanager
+
+
+@contextmanager
+def proxy_context():
+    """
+    代理设置的上下文管理器
+    """
+    # 保存原始代理设置
+    original_http_proxy = os.environ.get('HTTP_PROXY')
+    original_https_proxy = os.environ.get('HTTPS_PROXY')
+    
+    try:
+        # 设置新代理
+        proxy_url = "http://claude:claude202411@claude89757.cc:8081"
+        if proxy_url:
+            os.environ['HTTPS_PROXY'] = proxy_url
+            os.environ['HTTP_PROXY'] = proxy_url
+        else:
+            os.environ.pop('HTTP_PROXY', None)
+            os.environ.pop('HTTPS_PROXY', None)
+        yield
+    finally:
+        # 恢复原始代理
+        if original_http_proxy:
+            os.environ['HTTP_PROXY'] = original_http_proxy
+        else:
+            os.environ.pop('HTTP_PROXY', None)
+            
+        if original_https_proxy:
+            os.environ['HTTPS_PROXY'] = original_https_proxy
+        else:
+            os.environ.pop('HTTPS_PROXY', None)
 
 
 def process_tennis_video(video_path: str) -> dict:
@@ -61,23 +95,10 @@ def process_tennis_video(video_path: str) -> dict:
         """计算边界框中心点（归一化坐标 [xmin, ymin, xmax, ymax]）"""
         return ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0)
 
+    # ===== 欧几里得距离计算 =====
     def euclidean_distance(p1, p2):
         """计算两个2D点之间的欧几里得距离"""
         return math.dist(p1, p2)
-    
-    def bbox_iou(box1, box2):
-        """计算两个边界框的IoU（交并比）"""
-        x1 = max(box1[0], box2[0])
-        y1 = max(box1[1], box2[1])
-        x2 = min(box1[2], box2[2])
-        y2 = min(box1[3], box2[3])
-        
-        intersection = max(0, x2 - x1) * max(0, y2 - y1)
-        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-        union = area1 + area2 - intersection
-        
-        return intersection / union if union > 0 else 0
     
     # ===== 网球检测和分析函数 =====
     def is_motion_consistent(positions, min_velocity=0.005):
@@ -105,6 +126,7 @@ def process_tennis_video(video_path: str) -> dict:
                 
         return True
         
+    # ===== 重影网球判断函数 =====
     def is_motion_blur_ball(bbox, aspect_ratio_threshold=2.0):
         """判断边界框是否可能是重影网球（通常有更大的宽高比）"""
         width = bbox[2] - bbox[0]
@@ -403,6 +425,592 @@ def process_tennis_video(video_path: str) -> dict:
         result = overlay_bounding_boxes(enhanced_frame, boxes)
         return result
 
+    # ===== 网球球拍重叠判断函数 =====
+    def is_ball_inside_racket(ball_bbox, racket_bbox, overlap_threshold=0.3):
+        """
+        检测网球是否在球拍内部或与球拍有显著重叠
+        
+        参数:
+        ball_bbox: 网球边界框 [xmin, ymin, xmax, ymax]
+        racket_bbox: 球拍边界框 [xmin, ymin, xmax, ymax]
+        overlap_threshold: 重叠面积比例阈值，超过此阈值认为网球在球拍内
+        
+        返回:
+        bool: 如果网球与球拍重叠程度超过阈值且满足其他条件，返回True
+        """
+        # 计算交叉区域
+        x1 = max(ball_bbox[0], racket_bbox[0])
+        y1 = max(ball_bbox[1], racket_bbox[1])
+        x2 = min(ball_bbox[2], racket_bbox[2])
+        y2 = min(ball_bbox[3], racket_bbox[3])
+        
+        # 检查是否有交叉
+        if x1 >= x2 or y1 >= y2:
+            return False  # 没有交叉
+        
+        # 计算交叉区域面积
+        intersection_area = (x2 - x1) * (y2 - y1)
+        
+        # 计算网球面积
+        ball_area = (ball_bbox[2] - ball_bbox[0]) * (ball_bbox[3] - ball_bbox[1])
+        
+        # 计算网球被覆盖的比例
+        overlap_ratio = intersection_area / ball_area
+        
+        # 计算球拍面积，用于额外判断
+        racket_area = (racket_bbox[2] - racket_bbox[0]) * (racket_bbox[3] - racket_bbox[1])
+        
+        # 额外条件检查：
+        # 1. 网球面积不应过小（避免误判小的噪点）
+        # 2. 球拍面积应明显大于网球面积（真实场景中球拍总比网球大）
+        # 3. 重叠比例要足够高
+        
+        # 网球和球拍的面积比例检查（球拍应该明显大于网球）
+        area_ratio = racket_area / ball_area if ball_area > 0 else 0
+        
+        # 网球中心点
+        ball_center_x = (ball_bbox[0] + ball_bbox[2]) / 2
+        ball_center_y = (ball_bbox[1] + ball_bbox[3]) / 2
+        
+        # 检查网球中心点是否在球拍内部
+        center_inside = (racket_bbox[0] <= ball_center_x <= racket_bbox[2] and 
+                         racket_bbox[1] <= ball_center_y <= racket_bbox[3])
+        
+        # 综合判断：
+        # 1. 重叠比例超过阈值
+        # 2. 球拍面积至少是网球面积的2.5倍
+        # 3. 网球中心点在球拍内部
+        return (overlap_ratio > overlap_threshold and 
+                area_ratio > 2.5 and 
+                center_inside)
+
+    # ===== 过滤最佳球拍轨迹函数 =====
+    def filter_best_racket_track(racket_tracks, racket_sizes):
+        """
+        评估所有球拍轨迹，只保留评分最高的一个轨迹
+        
+        参数:
+        racket_tracks: 球拍轨迹字典 {track_id -> 轨迹点列表}
+        racket_sizes: 球拍大小字典 {track_id -> 大小列表}
+        
+        返回:
+        tuple: (最佳轨迹ID, 过滤掉的轨迹数量, 过滤掉的实例数量)
+        """
+        if not racket_tracks or len(racket_tracks) <= 1:
+            # 如果没有轨迹或只有一个轨迹，不需要过滤
+            return list(racket_tracks.keys())[0] if racket_tracks else None, 0, 0
+        
+        print(f"  发现 {len(racket_tracks)} 个球拍轨迹，进行评估以选择最佳轨迹...")
+        
+        # 为每个轨迹计算一个质量分数
+        racket_scores = {}
+        for track_id, track in racket_tracks.items():
+            # 1. 轨迹长度（检测实例数量）
+            track_length = len(track)
+            
+            # 2. 平均置信度
+            avg_confidence = sum(conf for _, _, _, conf in track) / track_length if track_length > 0 else 0
+            
+            # 3. 尺寸稳定性（尺寸变化不应太大）
+            sizes = racket_sizes.get(track_id, [])
+            size_stability = 1.0
+            if sizes and max(sizes) > 0:
+                size_stability = 1.0 - (max(sizes) - min(sizes)) / max(sizes)
+            
+            # 4. 帧间隔合理性（轨迹应较连续）
+            frame_indices = [f for f, _, _, _ in track]
+            frame_gaps = []
+            for i in range(1, len(frame_indices)):
+                frame_gaps.append(frame_indices[i] - frame_indices[i-1])
+            
+            avg_gap = sum(frame_gaps) / len(frame_gaps) if frame_gaps else float('inf')
+            gap_penalty = 1.0
+            if avg_gap > 3:  # 如果平均间隔大于3帧，应用惩罚因子
+                gap_penalty = 3.0 / avg_gap
+            
+            # 5. 轨迹的帧范围（覆盖更长时间范围的优先）
+            frame_range = max(frame_indices) - min(frame_indices) if frame_indices else 0
+            
+            # 组合以上因素计算最终分数
+            # 权重可以根据实际情况调整
+            score = (
+                track_length * 2.0 +              # 检测数量很重要
+                avg_confidence * 3.0 +            # 高置信度很重要
+                size_stability * 1.0 +            # 尺寸稳定性
+                gap_penalty * 1.0 +               # 连续性惩罚
+                (frame_range / 100.0) * 0.5       # 帧范围，归一化后影响较小
+            )
+            
+            racket_scores[track_id] = score
+            
+            # 输出每个轨迹的详细信息
+            print(f"  球拍轨迹 {track_id}: {track_length}个实例, 置信度={avg_confidence:.3f}, "
+                  f"尺寸稳定性={size_stability:.2f}, 平均间隔={avg_gap:.1f}帧, "
+                  f"帧范围={frame_range}, 得分={score:.2f}")
+        
+        # 选择得分最高的轨迹
+        best_track_id = max(racket_scores, key=racket_scores.get)
+        best_score = racket_scores[best_track_id]
+        
+        # 计算过滤统计
+        filtered_tracks = len(racket_tracks) - 1
+        filtered_instances = sum(len(track) for tid, track in racket_tracks.items() if tid != best_track_id)
+        
+        print(f"  选择球拍轨迹 {best_track_id} 作为最佳轨迹，得分: {best_score:.2f}")
+        print(f"  过滤掉 {filtered_tracks} 个轨迹，共 {filtered_instances} 个检测实例")
+        
+        return best_track_id, filtered_tracks, filtered_instances
+
+    # ===== 过滤最佳网球轨迹函数 =====
+    def filter_best_ball_track(ball_tracks, ball_sizes):
+        """
+        评估所有网球轨迹，只保留评分最高的一个轨迹
+        
+        参数:
+        ball_tracks: 网球轨迹字典 {track_id -> 轨迹点列表}
+        ball_sizes: 网球大小字典 {track_id -> 大小列表}
+        
+        返回:
+        tuple: (最佳轨迹ID, 过滤掉的轨迹数量, 过滤掉的实例数量)
+        """
+        if not ball_tracks or len(ball_tracks) <= 1:
+            # 如果没有轨迹或只有一个轨迹，不需要过滤
+            return list(ball_tracks.keys())[0] if ball_tracks else None, 0, 0
+        
+        print(f"  发现 {len(ball_tracks)} 个网球轨迹，进行评估以选择最佳轨迹...")
+        
+        # 为每个轨迹计算一个质量分数
+        ball_scores = {}
+        for track_id, track in ball_tracks.items():
+            # 1. 轨迹长度（检测实例数量）
+            track_length = len(track)
+            
+            # 2. 平均置信度
+            avg_confidence = sum(conf for _, _, _, conf in track) / track_length if track_length > 0 else 0
+            
+            # 3. 尺寸稳定性（网球大小应该相对稳定）
+            sizes = ball_sizes.get(track_id, [])
+            size_stability = 1.0
+            if sizes and max(sizes) > 0:
+                size_stability = 1.0 - (max(sizes) - min(sizes)) / max(sizes)
+            
+            # 4. 尺寸合理性（网球通常较小）
+            avg_size = sum(sizes) / len(sizes) if sizes else 0
+            size_reasonability = 1.0
+            if avg_size > 0.02:  # 如果网球太大，应用惩罚
+                size_reasonability = 0.02 / avg_size
+            
+            # 5. 帧间隔合理性（轨迹应较连续）
+            frame_indices = [f for f, _, _, _ in track]
+            frame_gaps = []
+            for i in range(1, len(frame_indices)):
+                frame_gaps.append(frame_indices[i] - frame_indices[i-1])
+            
+            avg_gap = sum(frame_gaps) / len(frame_gaps) if frame_gaps else float('inf')
+            gap_penalty = 1.0
+            if avg_gap > 3:  # 如果平均间隔大于3帧，应用惩罚因子
+                gap_penalty = 3.0 / avg_gap
+            
+            # 6. 轨迹的帧范围（覆盖更长时间范围的优先）
+            frame_range = max(frame_indices) - min(frame_indices) if frame_indices else 0
+            
+            # 7. 运动速度合理性（网球通常有较明显的运动）
+            motion_score = 0.0
+            if len(track) > 2:
+                centers = [center for _, center, _, _ in track]
+                total_distance = 0.0
+                for i in range(1, len(centers)):
+                    total_distance += euclidean_distance(centers[i-1], centers[i])
+                
+                # 计算平均每帧移动距离
+                avg_motion = total_distance / (len(centers) - 1) if len(centers) > 1 else 0
+                
+                # 网球应该有一定的移动，太静止可能是错误检测
+                if avg_motion < 0.01:
+                    motion_score = avg_motion * 100  # 静止球得分低
+                elif avg_motion > 0.1:
+                    motion_score = 1.0  # 移动明显得分高
+                else:
+                    motion_score = avg_motion * 10
+            
+            # 组合以上因素计算最终分数
+            # 权重可以根据实际情况调整
+            score = (
+                track_length * 1.5 +              # 检测数量很重要
+                avg_confidence * 2.0 +            # 高置信度很重要
+                size_stability * 1.0 +            # 尺寸稳定性
+                size_reasonability * 1.5 +        # 尺寸合理性
+                gap_penalty * 1.0 +               # 连续性惩罚
+                (frame_range / 100.0) * 0.5 +     # 帧范围，归一化后影响较小
+                motion_score * 2.0                # 运动分数，运动明显的网球更可能是真实的
+            )
+            
+            ball_scores[track_id] = score
+            
+            # 输出每个轨迹的详细信息
+            print(f"  网球轨迹 {track_id}: {track_length}个实例, 置信度={avg_confidence:.3f}, "
+                  f"尺寸稳定性={size_stability:.2f}, 尺寸合理性={size_reasonability:.2f}, "
+                  f"平均间隔={avg_gap:.1f}帧, 帧范围={frame_range}, 运动得分={motion_score:.2f}, "
+                  f"总得分={score:.2f}")
+        
+        # 选择得分最高的轨迹
+        best_track_id = max(ball_scores, key=ball_scores.get)
+        best_score = ball_scores[best_track_id]
+        
+        # 计算过滤统计
+        filtered_tracks = len(ball_tracks) - 1
+        filtered_instances = sum(len(track) for tid, track in ball_tracks.items() if tid != best_track_id)
+        
+        print(f"  选择网球轨迹 {best_track_id} 作为最佳轨迹，得分: {best_score:.2f}")
+        print(f"  过滤掉 {filtered_tracks} 个轨迹，共 {filtered_instances} 个检测实例")
+        
+        return best_track_id, filtered_tracks, filtered_instances
+    
+    # ===== 选择准备击球的最佳帧（球拍速度最小） =====
+    def find_prep_frame(best_contact_frame, racket_data, prep_start_idx):
+        """
+        选择准备击球动作时的帧，选择逻辑：
+        在best_contact_frame前，选择最靠近best_contact_frame，且球拍速度最小的帧
+        
+        参数:
+        best_contact_frame: 确定的接触帧索引
+        racket_data: 球拍数据字典 {frame_idx: (center, bbox, conf)}
+        prep_start_idx: 准备阶段的起始帧索引
+        
+        返回:
+        最佳准备帧的索引
+        """
+        candidates = {}  # 存储候选帧及其球拍速度
+        
+        # 获取接触帧范围内的所有球拍帧
+        prep_frames = [f for f in racket_data.keys() 
+                       if prep_start_idx <= f < best_contact_frame]
+        
+        if not prep_frames:
+            # 如果没有合适的候选帧，返回默认值
+            return max(0, best_contact_frame - 30)
+            
+        print(f"  分析 {len(prep_frames)} 个准备阶段的球拍帧")
+        
+        # 计算每一帧的球拍速度
+        for i in range(1, len(prep_frames)):
+            curr_idx = prep_frames[i]
+            prev_idx = prep_frames[i-1]
+            
+            # 如果帧间隔太大，跳过
+            if curr_idx - prev_idx > 5:
+                continue
+                
+            # 获取中心点
+            prev_center, _, _ = racket_data[prev_idx]
+            curr_center, _, _ = racket_data[curr_idx]
+            
+            # 计算速度 (归一化坐标的位移除以帧数)
+            velocity = euclidean_distance(prev_center, curr_center) / (curr_idx - prev_idx)
+            
+            # 记录当前帧的速度
+            candidates[curr_idx] = velocity
+            
+        if not candidates:
+            # 如果没有速度数据，使用最靠近接触帧的准备帧
+            closest_frame = max(prep_frames)
+            print(f"  没有有效的球拍速度数据，选择最靠近接触帧的准备帧: {closest_frame}")
+            return closest_frame
+            
+        # 打印候选帧的速度
+        print("  准备阶段球拍速度:")
+        for idx, speed in sorted(candidates.items()):
+            print(f"    帧 {idx}: 速度={speed:.6f}")
+        
+        # 选择速度最小的帧，如果有多个相近的最小速度，选择最靠近接触帧的
+        # 首先按照速度升序排序
+        sorted_candidates = sorted(candidates.items(), key=lambda x: x[1])
+        
+        # 找到速度最小的阈值（最小速度的1.2倍内）
+        min_speed = sorted_candidates[0][1]
+        speed_threshold = min_speed * 1.2
+        
+        # 在阈值范围内，选择最靠近接触帧的
+        closest_slow_frames = [idx for idx, speed in sorted_candidates 
+                              if speed <= speed_threshold]
+        
+        if closest_slow_frames:
+            best_prep_frame = max(closest_slow_frames)  # 最靠近接触帧的慢速帧
+            print(f"  选择帧 {best_prep_frame} 作为最佳准备帧，速度={candidates[best_prep_frame]:.6f}")
+            return best_prep_frame
+        else:
+            # 默认返回
+            return max(0, best_contact_frame - 30)
+    
+    # ===== 选择完成击球后的最佳帧（球拍位置最高） =====
+    def find_follow_frame(best_contact_frame, racket_data, follow_end_idx):
+        """
+        选择完成击球动作后的帧，选择逻辑：
+        在best_contact_frame后，选择最靠近best_contact_frame，且球拍位置最高的帧
+        
+        参数:
+        best_contact_frame: 确定的接触帧索引
+        racket_data: 球拍数据字典 {frame_idx: (center, bbox, conf)}
+        follow_end_idx: 跟随阶段的结束帧索引
+        
+        返回:
+        最佳跟随帧的索引
+        """
+        candidates = {}  # 存储候选帧及其球拍高度位置 (y坐标越小位置越高)
+        
+        # 获取接触帧后的球拍帧
+        follow_frames = [f for f in racket_data.keys() 
+                         if best_contact_frame < f <= follow_end_idx]
+        
+        if not follow_frames:
+            # 如果没有合适的候选帧，返回默认值
+            return min(len(frames_list) - 1, best_contact_frame + 30)
+            
+        print(f"  分析 {len(follow_frames)} 个跟随阶段的球拍帧")
+        
+        # 记录每一帧的球拍位置高度 (y坐标)
+        for idx in follow_frames:
+            center, _, _ = racket_data[idx]
+            # y坐标越小，位置越高 (图像坐标系中y轴向下)
+            y_position = center[1]
+            candidates[idx] = y_position
+            
+        if not candidates:
+            # 如果没有位置数据，使用最靠近接触帧的跟随帧
+            closest_frame = min(follow_frames)
+            print(f"  没有有效的球拍位置数据，选择最靠近接触帧的跟随帧: {closest_frame}")
+            return closest_frame
+            
+        # 打印候选帧的高度位置
+        print("  跟随阶段球拍高度位置:")
+        for idx, y_pos in sorted(candidates.items()):
+            print(f"    帧 {idx}: y坐标={y_pos:.4f} (越小越高)")
+        
+        # 选择位置最高的帧 (y坐标最小)
+        # 首先按照y坐标升序排序 (越小越高)
+        sorted_candidates = sorted(candidates.items(), key=lambda x: x[1])
+        
+        # 找到位置最高的阈值（最高位置的1.1倍内）
+        min_y = sorted_candidates[0][1]
+        height_threshold = min_y * 1.1
+        
+        # 在阈值范围内，选择最靠近接触帧的
+        closest_high_frames = [idx for idx, y_pos in sorted_candidates 
+                              if y_pos <= height_threshold]
+        
+        if closest_high_frames:
+            best_follow_frame = min(closest_high_frames)  # 最靠近接触帧的高位置帧
+            print(f"  选择帧 {best_follow_frame} 作为最佳跟随帧，y坐标={candidates[best_follow_frame]:.4f}")
+            return best_follow_frame
+        else:
+            # 默认返回
+            return min(len(frames_list) - 1, best_contact_frame + 30)
+        
+    # ===== 选择最佳接触帧 =====
+    def find_best_contact_frame(frames_list, ball_data, racket_data, velocity_changes):
+        """
+        选择最佳接触帧（网球和球拍距离最近的瞬间，即使它们不在同一帧）
+        
+        参数:
+        frames_list: 视频帧列表
+        ball_data: 网球数据字典 {frame_idx: (center, bbox, conf)}
+        racket_data: 球拍数据字典 {frame_idx: (center, bbox, conf)}
+        velocity_changes: 速度变化列表 [(frame_idx, change_score)]
+        
+        返回:
+        tuple: (最佳接触帧索引, 接触帧得分, 附近网球帧数, 显著候选帧列表)
+        """
+        contact_frame_candidates = []
+        significant_candidates = []
+        
+        # 首先检查是否有同帧包含球和拍的情况
+        same_frame_candidates = []
+        
+        # 评估每一帧的接触可能性
+        for f_idx in range(len(frames_list)):
+            if f_idx in ball_data and f_idx in racket_data:
+                ball_center, ball_bbox, ball_conf = ball_data[f_idx]
+                racket_center, racket_bbox, racket_conf = racket_data[f_idx]
+                
+                # 计算球和拍的距离 - 这是主要的评分因素
+                center_dist = euclidean_distance(ball_center, racket_center)
+                
+                # 简化评分逻辑：距离越近得分越高
+                distance_score = 1.0 / (center_dist + 0.001)
+                
+                # 考虑置信度
+                confidence_factor = ball_conf * racket_conf
+                contact_score = distance_score * confidence_factor
+                
+                # 考虑速度变化
+                velocity_change_factor = 0.0
+                for vc_idx, vc_score in velocity_changes:
+                    # 如果当前帧接近速度变化显著的帧，增加得分
+                    if abs(f_idx - vc_idx) <= 2:  # 允许2帧的误差
+                        velocity_change_factor = max(velocity_change_factor, vc_score)
+                
+                # 检查前后是否有网球（连续性检查）
+                continuity_factor = 0.0
+                nearby_frames_with_ball = 0
+                for offset in range(-3, 4):  # 检查前后3帧
+                    if offset == 0:
+                        continue
+                    check_idx = f_idx + offset
+                    if 0 <= check_idx < len(frames_list) and check_idx in ball_data:
+                        nearby_frames_with_ball += 1
+                        if abs(offset) == 1:  # 相邻帧权重更高
+                            continuity_factor += 0.3
+                        else:
+                            continuity_factor += 0.1
+                
+                # 最终得分：主要由距离决定，辅以连续性和速度变化
+                final_score = contact_score * (1.0 + velocity_change_factor) * (1.0 + continuity_factor)
+                
+                contact_info = {
+                    "frame_idx": f_idx,
+                    "distance": center_dist,
+                    "distance_score": distance_score,
+                    "velocity_change": velocity_change_factor,
+                    "continuity": continuity_factor,
+                    "confidence": confidence_factor,
+                    "final_score": final_score,
+                    "nearby_frames": nearby_frames_with_ball,
+                    "type": "same_frame"  # 标记为同帧类型
+                }
+                
+                same_frame_candidates.append((f_idx, final_score, nearby_frames_with_ball, contact_info))
+        
+        # 如果找到了同帧候选，直接使用
+        if same_frame_candidates:
+            print("  发现同帧包含网球和球拍的候选帧")
+            contact_frame_candidates = same_frame_candidates
+        else:
+            print("  未找到同帧包含网球和球拍的候选帧，尝试跨帧分析...")
+            # 跨帧分析：计算不同帧之间的球和拍距离
+            ball_frames = sorted(ball_data.keys())
+            racket_frames = sorted(racket_data.keys())
+            
+            # 定义最大允许的帧间距
+            max_frame_distance = 10
+            
+            for ball_idx in ball_frames:
+                ball_center, ball_bbox, ball_conf = ball_data[ball_idx]
+                
+                # 找出最接近的球拍帧
+                closest_racket_frames = []
+                for racket_idx in racket_frames:
+                    frame_distance = abs(ball_idx - racket_idx)
+                    if frame_distance <= max_frame_distance:
+                        closest_racket_frames.append((racket_idx, frame_distance))
+                
+                # 按照帧距离排序，取最近的几个
+                closest_racket_frames.sort(key=lambda x: x[1])
+                closest_racket_frames = closest_racket_frames[:3]  # 最多考虑3个最近的球拍帧
+                
+                for racket_idx, frame_distance in closest_racket_frames:
+                    racket_center, racket_bbox, racket_conf = racket_data[racket_idx]
+                    
+                    # 计算球和拍的空间距离
+                    center_dist = euclidean_distance(ball_center, racket_center)
+                    
+                    # 计算时间帧距离的惩罚因子 (越远越低)
+                    time_penalty = 1.0 / (1.0 + frame_distance * 0.3)
+                    
+                    # 综合空间距离和时间距离
+                    combined_dist = center_dist / time_penalty  # 时间越远，综合距离越大
+                    
+                    # 基于综合距离计算得分
+                    distance_score = 1.0 / (combined_dist + 0.001)
+                    
+                    # 考虑置信度
+                    confidence_factor = ball_conf * racket_conf
+                    contact_score = distance_score * confidence_factor
+                    
+                    # 考虑速度变化
+                    velocity_change_factor = 0.0
+                    for vc_idx, vc_score in velocity_changes:
+                        # 如果当前帧接近速度变化显著的帧，增加得分
+                        if abs(ball_idx - vc_idx) <= 2:  # 允许2帧的误差
+                            velocity_change_factor = max(velocity_change_factor, vc_score)
+                    
+                    # 检查前后是否有网球（连续性检查）
+                    continuity_factor = 0.0
+                    nearby_frames_with_ball = 0
+                    for offset in range(-3, 4):  # 检查前后3帧
+                        if offset == 0:
+                            continue
+                        check_idx = ball_idx + offset
+                        if 0 <= check_idx < len(frames_list) and check_idx in ball_data:
+                            nearby_frames_with_ball += 1
+                            if abs(offset) == 1:  # 相邻帧权重更高
+                                continuity_factor += 0.3
+                            else:
+                                continuity_factor += 0.1
+                    
+                    # 最终得分：主要由距离决定，辅以连续性和速度变化
+                    final_score = contact_score * (1.0 + velocity_change_factor) * (1.0 + continuity_factor)
+                    
+                    # 保存候选信息（以球的帧作为参考）
+                    contact_info = {
+                        "frame_idx": ball_idx,
+                        "racket_frame_idx": racket_idx,
+                        "frame_distance": frame_distance,
+                        "spatial_distance": center_dist,
+                        "combined_distance": combined_dist,
+                        "distance_score": distance_score,
+                        "velocity_change": velocity_change_factor,
+                        "continuity": continuity_factor,
+                        "confidence": confidence_factor,
+                        "final_score": final_score,
+                        "nearby_frames": nearby_frames_with_ball,
+                        "type": "cross_frame"  # 标记为跨帧类型
+                    }
+                    
+                    contact_frame_candidates.append((ball_idx, final_score, nearby_frames_with_ball, contact_info))
+                    
+                    if final_score > 2.0:  # 降低跨帧的打印阈值
+                        significant_candidates.append((ball_idx, final_score, nearby_frames_with_ball, contact_info))
+                        print(f"  球帧 {ball_idx} + 拍帧 {racket_idx}(距离{frame_distance}帧): "
+                              f"空间距离={center_dist:.4f}, 综合距离={combined_dist:.4f}, "
+                              f"距离评分={distance_score:.2f}, 置信度={confidence_factor:.2f}, "
+                              f"最终得分={final_score:.2f}")
+        
+        # 如果找不到候选帧，返回None
+        if not contact_frame_candidates:
+            print("\n未找到有效的接触帧候选")
+            return None, 0, 0, []
+        
+        # 按照得分和连续性排序
+        contact_frame_candidates.sort(key=lambda x: (x[2] >= 4, x[1]), reverse=True)
+        
+        # 筛选前5个候选项详细分析
+        if len(contact_frame_candidates) >= 5:
+            print("\n  排名前5的候选接触帧分析:")
+            for i, (f_idx, score, _, info) in enumerate(contact_frame_candidates[:5]):
+                if info["type"] == "same_frame":
+                    print(f"  [{i+1}] 帧 {f_idx}: 得分={score:.2f}, 距离={info['distance']:.4f} (同帧)")
+                else:
+                    print(f"  [{i+1}] 球帧 {f_idx} + 拍帧 {info['racket_frame_idx']}: "
+                          f"得分={score:.2f}, 空间距离={info['spatial_distance']:.4f}, "
+                          f"帧距离={info['frame_distance']} (跨帧)")
+        
+        # 选择得分最高的帧作为接触帧
+        best_frame, best_score, nearby_count, best_info = contact_frame_candidates[0]
+        
+        if best_info["type"] == "same_frame":
+            print(f"\n  选择帧 {best_frame} 作为最佳接触帧，得分: {best_score:.2f}")
+        else:
+            racket_frame = best_info["racket_frame_idx"]
+            frame_distance = best_info["frame_distance"]
+            print(f"\n  选择球帧 {best_frame} 作为最佳接触帧，对应拍帧 {racket_frame}(距离{frame_distance}帧)，得分: {best_score:.2f}")
+            # 添加信息到racket_data，使后续处理可以正常进行
+            if best_frame not in racket_data:
+                # 使用最近的球拍数据
+                racket_data[best_frame] = racket_data[racket_frame]
+                print(f"  将球拍数据从帧 {racket_frame} 复制到帧 {best_frame}，以便后续处理")
+        
+        return best_frame, best_score, nearby_count, significant_candidates
+
     # 从这里开始是主要处理逻辑
     #########################################
     # 1. 视频帧提取
@@ -416,35 +1024,17 @@ def process_tennis_video(video_path: str) -> dict:
     # 2. 网球和球拍检测与跟踪
     #########################################
     print("\n步骤2: 使用目标检测和跟踪模型...")
-    # 使用更精确的提示词，专注于网球，增加重影描述
-    tennis_ball_prompt = "blurred tennis ball in motion with motion blur, trailing effect, ghosting effect, multiple images"
-    print(f"  使用网球检测提示: '{tennis_ball_prompt}'")
-    
-    # 极低的检测阈值来捕获更多可能的网球，进一步降低阈值以捕获重影
-    ball_tracked = owlv2_sam2_video_tracking(tennis_ball_prompt, frames_list, box_threshold=0.35, chunk_length=8)
-    
-    # 备用检测方式，尝试捕获不同视角的重影网球
-    backup_ball_prompt = "fast moving tennis ball with motion blur, trailing effect"
-    backup_ball_tracked = owlv2_sam2_video_tracking(backup_ball_prompt, frames_list, box_threshold=0.3, chunk_length=8)
-    
-    # 合并主要和备用检测结果
-    combined_ball_tracked = []
-    for i in range(len(frames_list)):
-        frame_detections = []
-        if i < len(ball_tracked):
-            frame_detections.extend(ball_tracked[i])
-        if i < len(backup_ball_tracked):
-            frame_detections.extend(backup_ball_tracked[i])
-        combined_ball_tracked.append(frame_detections)
-    
-    # 使用合并后的结果
-    ball_tracked = combined_ball_tracked
-    
-    # 单独检测球拍
-    racket_prompt = "tennis racket with strings, professional tennis racket"
-    print(f"  使用球拍检测提示: '{racket_prompt}'")
-    racket_tracked = owlv2_sam2_video_tracking(racket_prompt, frames_list, box_threshold=0.6, chunk_length=15)
-    
+    with proxy_context():
+        # 使用更精确的提示词，专注于运动中、带拖影、模糊的网球
+        tennis_ball_prompt = "moving tennis ball with motion blur"
+        print(f"  使用网球检测提示: '{tennis_ball_prompt}'")
+        ball_tracked = owlv2_sam2_video_tracking(tennis_ball_prompt, frames_list, box_threshold=0.2, chunk_length=15)
+        
+        # 使用球拍检测提示
+        racket_prompt = "tennis racket in hand"
+        print(f"  使用球拍检测提示: '{racket_prompt}'")
+        racket_tracked = owlv2_sam2_video_tracking(racket_prompt, frames_list, box_threshold=0.4, chunk_length=25)
+
     # 合并球和拍的检测结果
     tracked = []
     for i in range(len(frames_list)):
@@ -464,145 +1054,10 @@ def process_tennis_video(video_path: str) -> dict:
     #########################################
     print("\n步骤3: 过滤和整理检测结果...")
     
-    # 初始化跟踪数据结构
-    ball_tracks = {}    # 网球轨迹字典：track_id -> 轨迹点列表
-    racket_tracks = {}  # 球拍轨迹字典：track_id -> 轨迹点列表
-    ball_sizes = {}     # 网球大小记录：track_id -> 大小列表
-    racket_sizes = {}   # 球拍大小记录：track_id -> 大小列表
-    ball_detection_count = 0  # 网球检测总数
-    racket_detection_count = 0  # 球拍检测总数
-
-    # 统计网球检测帧
-    frames_with_ball = set()
-    for i, preds in enumerate(tracked):
-        for det in preds:
-            if "ball" in det["label"].lower():
-                frames_with_ball.add(i)
-                break
-    
-    print(f"  在{len(frames_list)}帧中，有{len(frames_with_ball)}帧检测到网球")
-    
-    if frames_with_ball:
-        print("  检测到网球的帧索引列表:")
-        print("  ", sorted(list(frames_with_ball)))
-    else:
-        print("  没有检测到任何网球！")
-    
-    # 处理每一帧的检测结果，分离球和拍的轨迹
-    for i, preds in enumerate(tracked):
-        for det in preds:
-            lbl_lower = det["label"].lower()
-            bbox = det["bbox"]
-            bbox_center = get_bbox_center(bbox)
-            track_id = det["label"].split(":")[0]
-            
-            # 计算边界框面积
-            bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
-            
-            if "ball" in lbl_lower:
-                # 进一步放宽网球的面积过滤条件
-                if 0.0001 < bbox_area < 0.08:  # 极度放宽网球尺寸范围
-                    confidence = det.get("confidence", 0.5)  # 获取置信度，默认0.5
-                    
-                    # 检查是否可能是重影网球，如果是则提高置信度
-                    is_blur_ball = is_motion_blur_ball(bbox)
-                    if is_blur_ball:
-                        # 对于重影网球，增强置信度
-                        confidence = min(1.0, confidence * 1.2)
-                        
-                    # 极低的网球置信度阈值
-                    min_conf = 0.1
-                    if confidence >= min_conf:
-                        ball_tracks.setdefault(track_id, []).append((i, bbox_center, bbox, confidence))
-                        ball_sizes.setdefault(track_id, []).append(bbox_area)
-                        ball_detection_count += 1
-            elif "racket" in lbl_lower or "tennis racket" in lbl_lower:
-                confidence = det.get("confidence", 0.5)
-                # 降低球拍的置信度阈值
-                if confidence >= 0.2:
-                    racket_tracks.setdefault(track_id, []).append((i, bbox_center, bbox, confidence))
-                    racket_sizes.setdefault(track_id, []).append(bbox_area)
-                    racket_detection_count += 1
-    
-    print(f"  检测到 {ball_detection_count} 个网球实例，分布在 {len(ball_tracks)} 个可能的轨迹中")
-    print(f"  检测到 {racket_detection_count} 个球拍实例，分布在 {len(racket_tracks)} 个可能的轨迹中")
-    
-    # 打印网球轨迹详情
-    if len(ball_tracks) > 0:
-        print("\n  网球轨迹详细信息:")
-        for track_id, track in ball_tracks.items():
-            print(f"  网球轨迹 {track_id}: {len(track)} 个实例，在帧 {track[0][0]} 到 {track[-1][0]}")
-            print(f"    帧索引: ", end="")
-            frames_in_track = [f for f, _, _, _ in track]
-            
-            # 如果帧太多，只打印部分
-            if len(frames_in_track) > 20:
-                print(f"{frames_in_track[:10]} ... {frames_in_track[-10:]} (共{len(frames_in_track)}帧)")
-            else:
-                print(frames_in_track)
-                
-            # 打印置信度范围
-            confidences = [conf for _, _, _, conf in track]
-            print(f"    置信度范围: {min(confidences):.3f} - {max(confidences):.3f}, 平均: {sum(confidences)/len(confidences):.3f}")
-    
-    # 打印球拍轨迹详情
-    if len(racket_tracks) > 0:
-        print("\n  球拍轨迹详细信息:")
-        for track_id, track in racket_tracks.items():
-            print(f"  球拍轨迹 {track_id}: {len(track)} 个实例，在帧 {track[0][0]} 到 {track[-1][0]}")
+   
 
     #########################################
-    # 4. 网球未检测到时的备用方法
-    #########################################
-    if not ball_tracks:
-        print("\n未检测到网球，尝试使用备用方法...")
-        # 备用方法：根据大小和位置推测潜在的网球
-        potential_ball_tracks = {}
-        potential_ball_id = 0
-        
-        # 遍历所有帧，检查是否有可能是网球的小物体
-        for i, preds in enumerate(tracked):
-            for det in preds:
-                bbox = det["bbox"]
-                bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
-                bbox_center = get_bbox_center(bbox)
-                confidence = det.get("confidence", 0.3)
-                
-                # 只检查小物体，可能是网球
-                if 0.0001 < bbox_area < 0.03 and confidence > 0.2:
-                    track_id = f"potential_ball_{potential_ball_id}"
-                    potential_ball_tracks.setdefault(track_id, []).append((i, bbox_center, bbox, 0.3))
-                    potential_ball_id += 1
-        
-        if potential_ball_tracks:
-            print(f"  检测到 {len(potential_ball_tracks)} 个潜在网球轨迹")
-            # 使用这些潜在的网球替代正常的网球轨迹
-            ball_tracks = potential_ball_tracks
-            
-            # 重新计算大小数据
-            ball_sizes = {}
-            for tid, track in ball_tracks.items():
-                ball_sizes[tid] = [(bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) for (_, _, bbox, _) in track]
-                
-            # 更新球检测计数
-            ball_detection_count = sum(len(track) for track in ball_tracks.values())
-            
-            print(f"  使用备用方法检测到 {ball_detection_count} 个网球实例")
-    
-    # 检查是否有足够的网球和球拍轨迹
-    if not ball_tracks or not racket_tracks:
-        print("\n未检测到足够的网球或球拍，无法继续处理")
-        # 如果没有检测到，返回空结果
-        return {
-            "preparation_frame": "",
-            "contact_frame": "",
-            "follow_frame": "",
-            "stroke_video": "",
-            "output_directory": output_dir
-        }
-
-    #########################################
-    # 5. 评估轨迹质量和选择最佳轨迹
+    # 4. 评估轨迹质量和选择最佳轨迹
     #########################################
     print("\n步骤4: 评估检测轨迹质量...")
     # 使用改进的运动分析选择最可能的球和球拍
@@ -777,175 +1232,12 @@ def process_tennis_video(video_path: str) -> dict:
     # 9. 评估接触帧候选
     #########################################
     print("\n步骤8: 评估接触帧候选...")
-    # 评估每一帧的接触可能性
-    significant_candidates = []
-    
-    # 定义函数：选择最佳接触帧
-    def find_best_contact_frame(frames_list, ball_data, racket_data, velocity_changes):
-        """
-        选择最佳接触帧（网球和球拍最靠近但尚未接触或重合的瞬间）
-        
-        参数:
-        frames_list: 视频帧列表
-        ball_data: 网球数据字典 {frame_idx: (center, bbox, conf)}
-        racket_data: 球拍数据字典 {frame_idx: (center, bbox, conf)}
-        velocity_changes: 速度变化列表 [(frame_idx, change_score)]
-        
-        返回:
-        tuple: (最佳接触帧索引, 接触帧得分, 附近网球帧数)
-        """
-        contact_frame_candidates = []
-        significant_candidates = []
-        
-        # 评估每一帧的接触可能性
-        for f_idx in range(len(frames_list)):
-            if f_idx in ball_data and f_idx in racket_data:
-                ball_center, ball_bbox, ball_conf = ball_data[f_idx]
-                racket_center, racket_bbox, racket_conf = racket_data[f_idx]
-                
-                # 计算球和拍的距离
-                center_dist = euclidean_distance(ball_center, racket_center)
-                
-                # 检查球是否在球拍边界框内或非常接近
-                ball_in_racket = (ball_bbox[0] >= racket_bbox[0] and 
-                                ball_bbox[2] <= racket_bbox[2] and
-                                ball_bbox[1] >= racket_bbox[1] and
-                                ball_bbox[3] <= racket_bbox[3])
-                
-                # 计算IoU
-                iou = bbox_iou(ball_bbox, racket_bbox)
-                
-                # ===== 修改评分逻辑 =====
-                # 根据新需求，我们需要找到球和拍最靠近但尚未接触或重合的帧
-                
-                # 检查该帧是否有多个球的检测
-                multi_ball_penalty = 0.0
-                current_frame_detections = tracked[f_idx] if f_idx < len(tracked) else []
-                ball_count = sum(1 for det in current_frame_detections if "ball" in det["label"].lower())
-                if ball_count > 1:
-                    # 如果检测到多个球，严重降低该帧的得分
-                    multi_ball_penalty = 0.9  # 90%的惩罚
-                    print(f"  帧 {f_idx} 检测到 {ball_count} 个球，应用多球惩罚")
-                
-                # 1. 基础距离评分 - 距离越小评分越高，但有一个最小阈值以避免选择重合的
-                distance_score = 1.0 / (center_dist + 0.001)
-                
-                # 2. 重合或球在拍内的惩罚
-                overlap_penalty = 0.0
-                if ball_in_racket:  # 如果球在拍内，这是严重的重合，直接大幅度降低分数
-                    overlap_penalty = 0.95  # 95%的惩罚，基本排除这些帧
-                elif iou > 0.01:  # 非常严格的IoU阈值，几乎不允许任何重合
-                    # 指数惩罚，IoU越大惩罚越大
-                    overlap_penalty = min(0.9, iou * 10.0)  # 最大90%的惩罚
-                
-                # 综合所有惩罚因素
-                total_penalty = max(overlap_penalty, multi_ball_penalty)
-                
-                # 如果有较明显的重合或多球，直接放低得分
-                if total_penalty > 0.5:
-                    contact_score = distance_score * 0.1  # 只保留原始分数的10%
-                else:
-                    # 3. 重新计算基本接触得分 - 优先选择接近但不重合的单球帧
-                    contact_score = distance_score * (1.0 - total_penalty)
-                
-                # 额外奖励：距离合适且无重合的帧
-                # 找到一个合理的接近距离阈值
-                optimal_distance = 0.05  # 调整这个值以适应不同的场景
-                if center_dist < optimal_distance * 2.0 and overlap_penalty < 0.1:
-                    # 距离适中且几乎无重合，这是我们想要的
-                    proximity_bonus = 2.0 * (1.0 - (center_dist / (optimal_distance * 2.0)))
-                    contact_score += proximity_bonus
-                
-                # 考虑置信度
-                confidence_factor = ball_conf * racket_conf
-                contact_score *= confidence_factor
-                
-                # 考虑速度变化 - 保持不变，因为速度变化通常是接触前的指标
-                velocity_change_factor = 0.0
-                for vc_idx, vc_score in velocity_changes:
-                    # 如果当前帧接近速度变化显著的帧，增加得分
-                    if abs(f_idx - vc_idx) <= 2:  # 允许2帧的误差
-                        velocity_change_factor = max(velocity_change_factor, vc_score)
-                
-                # 添加：检查前后是否有网球（连续性检查）
-                continuity_factor = 0.0
-                nearby_frames_with_ball = 0
-                for offset in range(-3, 4):  # 检查前后3帧
-                    if offset == 0:
-                        continue
-                    check_idx = f_idx + offset
-                    if 0 <= check_idx < len(frames_list) and check_idx in ball_data:
-                        nearby_frames_with_ball += 1
-                        if abs(offset) == 1:  # 相邻帧权重更高
-                            continuity_factor += 0.3
-                        else:
-                            continuity_factor += 0.1
-                
-                # 调整接触得分，考虑连续性和速度变化
-                final_score = contact_score * (1.0 + velocity_change_factor) * (1.0 + continuity_factor)
-                
-                # 增加描述性信息
-                contact_info = {
-                    "frame_idx": f_idx,
-                    "distance": center_dist,
-                    "ball_in_racket": ball_in_racket,
-                    "iou": iou,
-                    "distance_score": distance_score,
-                    "overlap_penalty": overlap_penalty,
-                    "velocity_change": velocity_change_factor,
-                    "continuity": continuity_factor,
-                    "confidence": confidence_factor,
-                    "final_score": final_score,
-                    "nearby_frames": nearby_frames_with_ball
-                }
-                
-                contact_frame_candidates.append((f_idx, final_score, nearby_frames_with_ball, contact_info))
-                
-                if final_score > 4.0:  # 降低打印阈值
-                    significant_candidates.append((f_idx, final_score, nearby_frames_with_ball, contact_info))
-                    print(f"  帧 {f_idx}: 距离={center_dist:.4f}, 球在拍内={ball_in_racket}, IoU={iou:.4f}, 重合惩罚={overlap_penalty:.2f}, "
-                          f"距离评分={distance_score:.2f}, 置信度={confidence_factor:.2f}, 速度变化={velocity_change_factor:.2f}, "
-                          f"连续性={continuity_factor:.2f}, 附近帧数={nearby_frames_with_ball}, 最终得分={final_score:.2f}")
-        
-        # 如果找不到候选帧，返回None
-        if not contact_frame_candidates:
-            print("\n未找到有效的接触帧候选")
-            return None, 0, 0
-        
-        # 按照得分和连续性排序
-        contact_frame_candidates.sort(key=lambda x: (x[2] >= 4, x[1]), reverse=True)
-        
-        # 筛选前5个候选项详细分析
-        if len(contact_frame_candidates) >= 5:
-            print("\n  排名前5的候选接触帧分析:")
-            for i, (f_idx, score, _, info) in enumerate(contact_frame_candidates[:5]):
-                print(f"  [{i+1}] 帧 {f_idx}: 得分={score:.2f}, 距离={info['distance']:.4f}, "
-                      f"IoU={info['iou']:.4f}, 球在拍内={info['ball_in_racket']}, "
-                      f"重合惩罚={info['overlap_penalty']:.2f}")
-        
-        # 选择得分最高的帧作为接触帧
-        best_frame, best_score, nearby_count, _ = contact_frame_candidates[0]
-        
-        print(f"\n  选择帧 {best_frame} 作为最佳接触帧，得分: {best_score:.2f}")
-        
-        return best_frame, best_score, nearby_count
     
     # 使用函数选择最佳接触帧
     best_contact_result = find_best_contact_frame(frames_list, ball_data, racket_data, velocity_changes)
     
-    # 检查是否找到有效的接触帧
-    if best_contact_result[0] is None:
-        print("\n未找到有效的接触帧候选，无法继续处理")
-        return {
-            "preparation_frame": "",
-            "contact_frame": "",
-            "follow_frame": "",
-            "stroke_video": "",
-            "output_directory": output_dir
-        }
-    
     # 提取返回结果
-    best_contact_frame, best_score, nearby_count = best_contact_result
+    best_contact_frame, best_score, nearby_count, significant_candidates = best_contact_result
     
     print(f"\n步骤9: 确定最佳接触帧...")
     print(f"  选择帧 {best_contact_frame} 作为接触帧，得分: {best_score:.2f}")
@@ -983,146 +1275,6 @@ def process_tennis_video(video_path: str) -> dict:
             if prev_idx > best_contact_frame and speed > 0.01:  # 检测结束减速
                 follow_end_idx = min(len(frames_list) - 1, curr_idx + 10)
                 print(f"  检测到跟随减速点: 帧 {prev_idx}，速度={speed:.4f}")
-    
-    # 定义函数：选择准备击球的最佳帧（球拍速度最小）
-    def find_prep_frame(best_contact_frame, racket_data, prep_start_idx):
-        """
-        选择准备击球动作时的帧，选择逻辑：
-        在best_contact_frame前，选择最靠近best_contact_frame，且球拍速度最小的帧
-        
-        参数:
-        best_contact_frame: 确定的接触帧索引
-        racket_data: 球拍数据字典 {frame_idx: (center, bbox, conf)}
-        prep_start_idx: 准备阶段的起始帧索引
-        
-        返回:
-        最佳准备帧的索引
-        """
-        candidates = {}  # 存储候选帧及其球拍速度
-        
-        # 获取接触帧范围内的所有球拍帧
-        prep_frames = [f for f in racket_data.keys() 
-                       if prep_start_idx <= f < best_contact_frame]
-        
-        if not prep_frames:
-            # 如果没有合适的候选帧，返回默认值
-            return max(0, best_contact_frame - 30)
-            
-        print(f"  分析 {len(prep_frames)} 个准备阶段的球拍帧")
-        
-        # 计算每一帧的球拍速度
-        for i in range(1, len(prep_frames)):
-            curr_idx = prep_frames[i]
-            prev_idx = prep_frames[i-1]
-            
-            # 如果帧间隔太大，跳过
-            if curr_idx - prev_idx > 5:
-                continue
-                
-            # 获取中心点
-            prev_center, _, _ = racket_data[prev_idx]
-            curr_center, _, _ = racket_data[curr_idx]
-            
-            # 计算速度 (归一化坐标的位移除以帧数)
-            velocity = euclidean_distance(prev_center, curr_center) / (curr_idx - prev_idx)
-            
-            # 记录当前帧的速度
-            candidates[curr_idx] = velocity
-            
-        if not candidates:
-            # 如果没有速度数据，使用最靠近接触帧的准备帧
-            closest_frame = max(prep_frames)
-            print(f"  没有有效的球拍速度数据，选择最靠近接触帧的准备帧: {closest_frame}")
-            return closest_frame
-            
-        # 打印候选帧的速度
-        print("  准备阶段球拍速度:")
-        for idx, speed in sorted(candidates.items()):
-            print(f"    帧 {idx}: 速度={speed:.6f}")
-        
-        # 选择速度最小的帧，如果有多个相近的最小速度，选择最靠近接触帧的
-        # 首先按照速度升序排序
-        sorted_candidates = sorted(candidates.items(), key=lambda x: x[1])
-        
-        # 找到速度最小的阈值（最小速度的1.2倍内）
-        min_speed = sorted_candidates[0][1]
-        speed_threshold = min_speed * 1.2
-        
-        # 在阈值范围内，选择最靠近接触帧的
-        closest_slow_frames = [idx for idx, speed in sorted_candidates 
-                              if speed <= speed_threshold]
-        
-        if closest_slow_frames:
-            best_prep_frame = max(closest_slow_frames)  # 最靠近接触帧的慢速帧
-            print(f"  选择帧 {best_prep_frame} 作为最佳准备帧，速度={candidates[best_prep_frame]:.6f}")
-            return best_prep_frame
-        else:
-            # 默认返回
-            return max(0, best_contact_frame - 30)
-    
-    # 定义函数：选择完成击球后的最佳帧（球拍位置最高）
-    def find_follow_frame(best_contact_frame, racket_data, follow_end_idx):
-        """
-        选择完成击球动作后的帧，选择逻辑：
-        在best_contact_frame后，选择最靠近best_contact_frame，且球拍位置最高的帧
-        
-        参数:
-        best_contact_frame: 确定的接触帧索引
-        racket_data: 球拍数据字典 {frame_idx: (center, bbox, conf)}
-        follow_end_idx: 跟随阶段的结束帧索引
-        
-        返回:
-        最佳跟随帧的索引
-        """
-        candidates = {}  # 存储候选帧及其球拍高度位置 (y坐标越小位置越高)
-        
-        # 获取接触帧后的球拍帧
-        follow_frames = [f for f in racket_data.keys() 
-                         if best_contact_frame < f <= follow_end_idx]
-        
-        if not follow_frames:
-            # 如果没有合适的候选帧，返回默认值
-            return min(len(frames_list) - 1, best_contact_frame + 30)
-            
-        print(f"  分析 {len(follow_frames)} 个跟随阶段的球拍帧")
-        
-        # 记录每一帧的球拍位置高度 (y坐标)
-        for idx in follow_frames:
-            center, _, _ = racket_data[idx]
-            # y坐标越小，位置越高 (图像坐标系中y轴向下)
-            y_position = center[1]
-            candidates[idx] = y_position
-            
-        if not candidates:
-            # 如果没有位置数据，使用最靠近接触帧的跟随帧
-            closest_frame = min(follow_frames)
-            print(f"  没有有效的球拍位置数据，选择最靠近接触帧的跟随帧: {closest_frame}")
-            return closest_frame
-            
-        # 打印候选帧的高度位置
-        print("  跟随阶段球拍高度位置:")
-        for idx, y_pos in sorted(candidates.items()):
-            print(f"    帧 {idx}: y坐标={y_pos:.4f} (越小越高)")
-        
-        # 选择位置最高的帧 (y坐标最小)
-        # 首先按照y坐标升序排序 (越小越高)
-        sorted_candidates = sorted(candidates.items(), key=lambda x: x[1])
-        
-        # 找到位置最高的阈值（最高位置的1.1倍内）
-        min_y = sorted_candidates[0][1]
-        height_threshold = min_y * 1.1
-        
-        # 在阈值范围内，选择最靠近接触帧的
-        closest_high_frames = [idx for idx, y_pos in sorted_candidates 
-                              if y_pos <= height_threshold]
-        
-        if closest_high_frames:
-            best_follow_frame = min(closest_high_frames)  # 最靠近接触帧的高位置帧
-            print(f"  选择帧 {best_follow_frame} 作为最佳跟随帧，y坐标={candidates[best_follow_frame]:.4f}")
-            return best_follow_frame
-        else:
-            # 默认返回
-            return min(len(frames_list) - 1, best_contact_frame + 30)
     
     # 使用新函数选择最佳准备帧和跟随帧
     prep_frame_idx = find_prep_frame(best_contact_frame, racket_data, prep_start_idx)
