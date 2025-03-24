@@ -13,7 +13,14 @@ def proxy_context():
     
     try:
         # 设置新代理
-        proxy_url = os.environ.get('PROXY_URL')
+        try: 
+            from airflow.models import Variable
+            proxy_url = Variable.get('PROXY_URL')
+            if not proxy_url:
+                raise
+        except:
+            proxy_url = os.environ.get('PROXY_URL')
+
         if proxy_url:
             os.environ['HTTPS_PROXY'] = proxy_url
             os.environ['HTTP_PROXY'] = proxy_url
@@ -34,7 +41,7 @@ def proxy_context():
             os.environ.pop('HTTPS_PROXY', None)
 
 
-def process_tennis_video(video_path: str) -> dict:
+def process_tennis_video(video_path: str, output_dir: str) -> dict:
     """
     Processes a tennis video to find a complete stroke that includes
     a contact moment between the player's tennis racket and the moving ball. 
@@ -76,7 +83,7 @@ def process_tennis_video(video_path: str) -> dict:
     # 创建唯一的输出目录
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     video_name = os.path.basename(video_path).split('.')[0]
-    output_dir = f"./output/{video_name}_{timestamp}"
+    output_dir = f"{output_dir}/{video_name}_{timestamp}"
     os.makedirs(output_dir, exist_ok=True)
     
     print(f"===== 开始处理网球视频: {video_path} =====")
@@ -176,7 +183,143 @@ def process_tennis_video(video_path: str) -> dict:
         player_video_path = os.path.join(videos_dir, "player_detection.mp4")
         save_video(player_frames, player_video_path, fps=30)
         print(f"  网球运动员检测视频已保存至: {player_video_path}")
+
+    # ===== 保存包含过滤后的检测结果的视频 =====
+    def save_video_with_filtered_detections(output_dir: str, frames_list: list, ball_tracked: list, racket_tracked: list, player_tracked: list):
+        """
+        保存包含过滤后的检测结果的视频
+        """
+        # 创建视频输出目录
+        videos_dir = os.path.join(output_dir, "filtered_videos")
+        os.makedirs(videos_dir, exist_ok=True)
         
+        # 生成叠加所有检测结果的综合视频
+        print("  正在生成综合检测结果视频...")
+        combined_frames = frames_list.copy()
+        
+        # 遍历所有帧，添加所有对象的检测框
+        for i, frame in enumerate(combined_frames):
+            boxes = []
+            
+            # 添加网球检测框
+            if i < len(ball_tracked) and ball_tracked[i]:
+                for detection in ball_tracked[i]:
+                    score = detection.get("score", 0)
+                    boxes.append({
+                        "bbox": detection["bbox"],
+                        "label": f"Tennis Ball {score:.2f}",
+                        "color": (255, 255, 0),  # 黄色
+                        "score": score
+                    })
+            
+            # 添加球拍检测框
+            if i < len(racket_tracked) and racket_tracked[i]:
+                for detection in racket_tracked[i]:
+                    score = detection.get("score", 0)
+                    boxes.append({
+                        "bbox": detection["bbox"],
+                        "label": f"Tennis Racket {score:.2f}",
+                        "color": (0, 0, 255),  # 红色
+                        "score": score
+                    })
+            
+            # 添加运动员检测框
+            if i < len(player_tracked) and player_tracked[i]:
+                for detection in player_tracked[i]:
+                    score = detection.get("score", 0)
+                    boxes.append({
+                        "bbox": detection["bbox"],
+                        "label": f"Tennis Player {score:.2f}",
+                        "color": (0, 255, 0),  # 绿色
+                        "score": score
+                    })
+            
+            # 将检测框叠加到帧上
+            if boxes:
+                combined_frames[i] = overlay_bounding_boxes(frame, boxes)
+        
+        # 保存综合检测视频，确保颜色正确
+        combined_video_path = os.path.join(videos_dir, "combined_detection.mp4")
+        save_video(combined_frames, combined_video_path, fps=30)
+        print(f"  综合检测视频已保存至: {combined_video_path}")
+        
+        # 生成仅包含网球的检测视频
+        print("  正在生成网球检测结果视频...")
+        ball_frames = frames_list.copy()
+        
+        # 遍历所有帧，添加网球检测框
+        for i, frame in enumerate(ball_frames):
+            boxes = []
+            if i < len(ball_tracked) and ball_tracked[i]:
+                for detection in ball_tracked[i]:
+                    score = detection.get("score", 0)
+                    boxes.append({
+                        "bbox": detection["bbox"],
+                        "label": f"Tennis Ball {score:.2f}",
+                        "color": (255, 255, 0),  # 黄色
+                        "score": score
+                    })
+            
+            # 将检测框叠加到帧上
+            if boxes:
+                ball_frames[i] = overlay_bounding_boxes(frame, boxes)
+        
+        # 保存网球检测视频，确保颜色正确
+        ball_video_path = os.path.join(videos_dir, "ball_detection_filtered.mp4")
+        save_video(ball_frames, ball_video_path, fps=30)
+        print(f"  过滤后的网球检测视频已保存至: {ball_video_path}")
+        
+        # 生成仅包含球拍的检测视频
+        print("  正在生成球拍检测结果视频...")
+        racket_frames = frames_list.copy()
+        
+        # 遍历所有帧，添加球拍检测框
+        for i, frame in enumerate(racket_frames):
+            boxes = []
+            if i < len(racket_tracked) and racket_tracked[i]:
+                for detection in racket_tracked[i]:
+                    score = detection.get("score", 0)
+                    boxes.append({
+                        "bbox": detection["bbox"],
+                        "label": f"Tennis Racket {score:.2f}",
+                        "color": (0, 0, 255),  # 红色
+                        "score": score
+                    })
+            
+            # 将检测框叠加到帧上
+            if boxes:
+                racket_frames[i] = overlay_bounding_boxes(frame, boxes)
+        
+        # 保存球拍检测视频，确保颜色正确
+        racket_video_path = os.path.join(videos_dir, "racket_detection_filtered.mp4")
+        save_video(racket_frames, racket_video_path, fps=30)
+        print(f"  过滤后的球拍检测视频已保存至: {racket_video_path}")
+        
+        # 生成仅包含运动员的检测视频
+        print("  正在生成运动员检测结果视频...")
+        player_frames = frames_list.copy()
+        
+        # 遍历所有帧，添加运动员检测框
+        for i, frame in enumerate(player_frames):
+            boxes = []
+            if i < len(player_tracked) and player_tracked[i]:
+                for detection in player_tracked[i]:
+                    score = detection.get("score", 0)
+                    boxes.append({
+                        "bbox": detection["bbox"],
+                        "label": f"Tennis Player {score:.2f}",
+                        "color": (0, 255, 0),  # 绿色
+                        "score": score
+                    })
+            
+            # 将检测框叠加到帧上
+            if boxes:
+                player_frames[i] = overlay_bounding_boxes(frame, boxes)
+        
+        # 保存运动员检测视频，确保颜色正确
+        player_video_path = os.path.join(videos_dir, "player_detection_filtered.mp4")
+        save_video(player_frames, player_video_path, fps=30)
+        print(f"  过滤后的运动员检测视频已保存至: {player_video_path}")
 
     # ===== 过滤网球，仅保留一个网球 =====
     def filter_tennis_ball(ball_tracked: list, racket_tracked: list) -> list:
@@ -1096,7 +1239,7 @@ def process_tennis_video(video_path: str) -> dict:
         return filtered_player
     
     # ===== 选择最佳接触帧 =====
-    def select_contact_frame(ball_tracked: list, racket_tracked: list, player_tracked: list) -> int:
+    def select_contact_frame(ball_tracked: list, racket_tracked: list, player_tracked: list, fps: float = 30) -> int:
         """
         选择最佳接触帧（逻辑： 网球和网球拍最近距离的帧, 可能要考虑网球拍和网球不在同一帧的情况）
         
@@ -1108,6 +1251,8 @@ def process_tennis_video(video_path: str) -> dict:
             过滤后的球拍检测结果
         player_tracked: list
             过滤后的网球运动员检测结果
+        fps: float
+            视频帧率，用于计算基于时间的搜索范围
             
         Returns:
         --------
@@ -1146,9 +1291,10 @@ def process_tennis_video(video_path: str) -> dict:
                     nearest_racket_frame = -1
                     min_frame_diff = float('inf')
                     
-                    # 在前后10帧范围内查找
-                    search_start = max(0, i - 10)
-                    search_end = min(max_search_frames, i + 10)
+                    # 在前后0.5秒范围内查找
+                    search_window = int(fps * 0.5)  # 前后0.5秒
+                    search_start = max(0, i - search_window)
+                    search_end = min(max_search_frames, i + search_window)
                     
                     for j in range(search_start, search_end):
                         if racket_tracked[j]:
@@ -1273,7 +1419,7 @@ def process_tennis_video(video_path: str) -> dict:
         return best_frame_idx
 
     # ===== 选择准备动作帧 =====
-    def select_preparation_frame(contact_frame: int, ball_tracked: list, racket_tracked: list, player_tracked: list) -> int:
+    def select_preparation_frame(contact_frame: int, ball_tracked: list, racket_tracked: list, player_tracked: list, fps: float = 30) -> int:
         """
         选择准备动作帧（逻辑： 最佳接触帧前，离最佳接触帧最近，网球拍速度最小的帧）
         
@@ -1287,6 +1433,8 @@ def process_tennis_video(video_path: str) -> dict:
             过滤后的球拍检测结果
         player_tracked: list
             过滤后的网球运动员检测结果
+        fps: float
+            视频帧率，用于计算基于时间的搜索范围
             
         Returns:
         --------
@@ -1298,8 +1446,9 @@ def process_tennis_video(video_path: str) -> dict:
         # 初始设定
         max_frames = len(racket_tracked)
         
-        # 设置搜索范围 - 接触帧前1秒内 (假设60fps，则查找前60帧)
-        search_range = min(60, contact_frame)
+        # 设置搜索范围 - 接触帧前1秒内
+        search_frames = int(fps)  # 1秒内的帧数
+        search_range = min(search_frames, contact_frame)
         min_search_idx = max(0, contact_frame - search_range)
         
         # 初始化变量
@@ -1347,12 +1496,13 @@ def process_tennis_video(video_path: str) -> dict:
         
         # 额外检查：如果找到的准备帧离接触帧太近，可能不是真正的准备阶段
         # 理想情况下，准备动作应该发生在接触前的适当距离
-        min_frame_distance = 5  # 至少5帧的距离
+        min_frame_distance = int(fps * 0.08)  # 大约为接触前0.08秒
+        min_frame_distance = max(5, min_frame_distance)  # 至少5帧的距离
         
         if contact_frame - best_prep_idx < min_frame_distance and best_prep_idx > min_search_idx:
             # 尝试在更早的时间段内再次寻找
             secondary_search_end = best_prep_idx - 1
-            secondary_search_start = max(0, min_search_idx - 30)  # 再往前30帧
+            secondary_search_start = max(0, min_search_idx - int(fps * 0.5))  # 再往前0.5秒
             
             secondary_best_idx = secondary_search_start
             secondary_min_velocity = float('inf')
@@ -1395,15 +1545,15 @@ def process_tennis_video(video_path: str) -> dict:
         
         # 如果没有找到合适的准备帧，使用默认帧（离接触帧适当距离的帧）
         if best_prep_idx == contact_frame:
-            default_prep_idx = max(0, contact_frame - 20)  # 默认使用接触帧前20帧
+            default_prep_idx = max(0, contact_frame - int(fps * 0.33))  # 默认使用接触帧前1/3秒
             best_prep_idx = default_prep_idx
-            print(f"警告: 无法找到合适的准备帧，使用默认帧 (接触帧-20)")
+            print(f"警告: 无法找到合适的准备帧，使用默认帧 (接触帧-{int(fps * 0.33)}帧)")
         
         print(f"最佳准备动作帧索引: {best_prep_idx} (接触帧: {contact_frame})")
         return best_prep_idx
 
     # ===== 选择跟随动作帧 =====
-    def select_follow_frame(contact_frame: int, ball_tracked: list, racket_tracked: list, player_tracked: list) -> int:
+    def select_follow_frame(contact_frame: int, ball_tracked: list, racket_tracked: list, player_tracked: list, fps: float = 30) -> int:
         """
         选择跟随动作帧（逻辑： 最佳接触帧后, 离最佳接触帧最近，且网球拍位置最高的帧）
         
@@ -1417,6 +1567,8 @@ def process_tennis_video(video_path: str) -> dict:
             过滤后的球拍检测结果
         player_tracked: list
             过滤后的网球运动员检测结果
+        fps: float
+            视频帧率，用于计算基于时间的搜索范围
             
         Returns:
         --------
@@ -1428,9 +1580,9 @@ def process_tennis_video(video_path: str) -> dict:
         # 初始设定
         max_frames = len(racket_tracked)
         
-        # 设置搜索范围 - 接触帧后1秒内 (假设60fps，搜索60帧)
-        search_range = 60
-        max_search_idx = min(max_frames - 1, contact_frame + search_range)
+        # 设置搜索范围 - 接触帧后1秒内
+        search_frames = int(fps)  # 1秒内的帧数
+        max_search_idx = min(max_frames - 1, contact_frame + search_frames)
         
         # 初始化变量
         best_follow_idx = max_search_idx  # 默认使用搜索范围内最晚的帧
@@ -1454,7 +1606,7 @@ def process_tennis_video(video_path: str) -> dict:
             
             # 如果发现球拍位置开始下降，这可能表示跟随动作已经完成
             # 检查后续几帧，如果球拍持续下降，则停止搜索
-            if i > contact_frame + 10 and racket_top < highest_position:
+            if i > contact_frame + int(fps * 0.17) and racket_top < highest_position:  # 大约接触后0.17秒
                 consecutive_drops = 0
                 for j in range(i + 1, min(i + 5, max_search_idx + 1)):
                     if racket_tracked[j]:
@@ -1467,12 +1619,13 @@ def process_tennis_video(video_path: str) -> dict:
                     break
         
         # 确保跟随帧与接触帧有足够距离
-        min_frame_distance = 10  # 至少10帧的距离
+        min_frame_distance = int(fps * 0.17)  # 大约接触后0.17秒
+        min_frame_distance = max(10, min_frame_distance)  # 至少10帧的距离
         
         if best_follow_idx - contact_frame < min_frame_distance:
             # 如果太近，尝试找到稍远但仍然合理的帧
             secondary_search_start = contact_frame + min_frame_distance
-            secondary_search_end = min(max_frames - 1, contact_frame + search_range)
+            secondary_search_end = min(max_frames - 1, contact_frame + search_frames)
             
             if secondary_search_start <= secondary_search_end:
                 secondary_best_idx = secondary_search_start
@@ -1495,21 +1648,253 @@ def process_tennis_video(video_path: str) -> dict:
         
         # 如果没有找到合适的跟随帧，使用默认帧（接触帧后适当距离的帧）
         if best_follow_idx == contact_frame or best_follow_idx >= max_frames:
-            default_follow_idx = min(max_frames - 1, contact_frame + 20)  # 默认使用接触帧后20帧
+            default_follow_idx = min(max_frames - 1, contact_frame + int(fps * 0.33))  # 默认使用接触帧后1/3秒
             best_follow_idx = default_follow_idx
-            print(f"警告: 无法找到合适的跟随帧，使用默认帧 (接触帧+20)")
+            print(f"警告: 无法找到合适的跟随帧，使用默认帧 (接触帧+{int(fps * 0.33)}帧)")
         
         print(f"最佳跟随动作帧索引: {best_follow_idx} (接触帧: {contact_frame})")
         return best_follow_idx
+    
+    # ===== 视频帧提取 =====
+    def extract_part_frames(video_path: str) -> list:
+        """
+        提取视频帧并返回帧数据列表
+        """
+        print("\n步骤1: 从视频中提取帧...")
+        # 首先获取视频的实际帧率
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"无法打开视频: {video_path}")
+        
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        video_duration = total_frames / actual_fps if actual_fps > 0 else 0
+        cap.release()
+        
+        # 限制只分析前6秒的视频内容
+        max_seconds = 6
+        max_frames = int(actual_fps * max_seconds)
+        
+        print(f"  视频实际帧率: {actual_fps:.2f} fps")
+        print(f"  视频总长度: {video_duration:.2f} 秒 ({total_frames} 帧)")
+        print(f"  将仅分析前 {max_seconds} 秒的内容 (最多 {max_frames} 帧)")
+        
+        # 提取帧并限制数量
+        frames_data = extract_frames_and_timestamps(video_path, fps=actual_fps)
+        
+        # 如果提取的帧超过了最大帧数，则只保留前max_frames帧
+        if len(frames_data) > max_frames:
+            frames_data = frames_data[:max_frames]
+            print(f"  截取了前 {len(frames_data)} 帧用于分析")
+        
+        frames_list = [f["frame"] for f in frames_data]
+        print(f"  最终使用 {len(frames_list)} 帧进行分析")
+        return frames_list, actual_fps
+
+    # ===== 保存最佳接触帧的完整动作的视频 =====
+    def save_video_with_one_action(output_dir: str, frames_list: list, ball_tracked: list, racket_tracked: list, player_tracked: list, contact_frame: int, prep_frame: int, follow_frame: int):
+        """
+        保存最佳接触帧的完整动作视频，包含准备、接触和跟随三个阶段
+        
+        Parameters:
+        -----------
+        output_dir: str
+            输出目录
+        frames_list: list
+            视频帧列表
+        ball_tracked: list
+            过滤后的网球检测结果
+        racket_tracked: list
+            过滤后的球拍检测结果
+        player_tracked: list
+            过滤后的网球运动员检测结果
+        contact_frame: int
+            接触帧索引
+        prep_frame: int
+            准备动作帧索引
+        follow_frame: int
+            跟随动作帧索引
+            
+        Returns:
+        --------
+        str:
+            保存的视频路径
+        """
+        print("\n保存完整击球动作视频...")
+        
+        # 创建视频输出目录
+        videos_dir = os.path.join(output_dir, "action_videos")
+        os.makedirs(videos_dir, exist_ok=True)
+        
+        # 确定视频片段的起始和结束帧
+        start_frame = prep_frame
+        end_frame = follow_frame
+        
+        # 确保帧索引有效
+        start_frame = max(0, start_frame)
+        end_frame = min(len(frames_list) - 1, end_frame)
+        
+        # 提取动作视频帧
+        action_frames = frames_list[start_frame:end_frame+1]
+        
+        # 为每一帧添加检测框
+        annotated_frames = []
+        
+        for i, frame in enumerate(action_frames):
+            current_frame_idx = start_frame + i
+            boxes = []
+            
+            # 添加网球检测框
+            if current_frame_idx < len(ball_tracked) and ball_tracked[current_frame_idx]:
+                for ball in ball_tracked[current_frame_idx]:
+                    score = ball.get("score", 0)
+                    boxes.append({
+                        "bbox": ball["bbox"],
+                        "label": f"Tennis Ball {score:.2f}",
+                        "color": (255, 255, 0),  # 黄色
+                        "score": score
+                    })
+            
+            # 添加球拍检测框
+            if current_frame_idx < len(racket_tracked) and racket_tracked[current_frame_idx]:
+                for racket in racket_tracked[current_frame_idx]:
+                    score = racket.get("score", 0)
+                    boxes.append({
+                        "bbox": racket["bbox"],
+                        "label": f"Tennis Racket {score:.2f}",
+                        "color": (0, 0, 255),  # 红色
+                        "score": score
+                    })
+            
+            # 添加运动员检测框
+            if current_frame_idx < len(player_tracked) and player_tracked[current_frame_idx]:
+                for player in player_tracked[current_frame_idx]:
+                    score = player.get("score", 0)
+                    boxes.append({
+                        "bbox": player["bbox"],
+                        "label": f"Tennis Player {score:.2f}",
+                        "color": (0, 255, 0),  # 绿色
+                        "score": score
+                    })
+            
+            # 将检测框叠加到帧上
+            frame_with_boxes = frame.copy()
+            if boxes:
+                frame_with_boxes = overlay_bounding_boxes(frame, boxes)
+            
+            # 添加阶段标识
+            # 在帧上添加文字说明当前是准备/接触/跟随阶段
+            frame_height, frame_width = frame_with_boxes.shape[:2]
+            
+            # 确定当前帧的阶段
+            phase_text = ""
+            text_color = (255, 255, 255)  # 白色文字
+            
+            if current_frame_idx < contact_frame:
+                phase_text = "preparation"
+                text_color = (255, 255, 0)  # 黄色
+            elif current_frame_idx == contact_frame:
+                phase_text = "contact"
+                text_color = (0, 0, 255)  # 红色
+            else:
+                phase_text = "follow"
+                text_color = (0, 255, 0)  # 绿色
+            
+            # 在帧上添加阶段文字
+            cv2.putText(
+                frame_with_boxes, 
+                phase_text, 
+                (10, 30),  # 位置 (左上角)
+                cv2.FONT_HERSHEY_SIMPLEX,  # 字体
+                1,  # 字体大小
+                text_color,  # 字体颜色
+                2,  # 线宽
+                cv2.LINE_AA  # 抗锯齿
+            )
+            
+            # 特殊标记关键帧
+            if current_frame_idx == prep_frame:
+                # 在准备帧上添加特殊标记
+                cv2.putText(
+                    frame_with_boxes, 
+                    "preparation", 
+                    (10, 70),  # 位置 (左上角)
+                    cv2.FONT_HERSHEY_SIMPLEX,  # 字体
+                    1,  # 字体大小
+                    (255, 255, 0),  # 黄色
+                    2,  # 线宽
+                    cv2.LINE_AA  # 抗锯齿
+                )
+                # 添加边框
+                cv2.rectangle(
+                    frame_with_boxes,
+                    (0, 0),
+                    (frame_width-1, frame_height-1),
+                    (255, 255, 0),  # 黄色边框
+                    5  # 边框宽度
+                )
+            
+            if current_frame_idx == contact_frame:
+                # 在接触帧上添加特殊标记
+                cv2.putText(
+                    frame_with_boxes, 
+                    "contact", 
+                    (10, 70),  # 位置 (左上角)
+                    cv2.FONT_HERSHEY_SIMPLEX,  # 字体
+                    1,  # 字体大小
+                    (0, 0, 255),  # 红色
+                    2,  # 线宽
+                    cv2.LINE_AA  # 抗锯齿
+                )
+                # 添加边框
+                cv2.rectangle(
+                    frame_with_boxes,
+                    (0, 0),
+                    (frame_width-1, frame_height-1),
+                    (0, 0, 255),  # 红色边框
+                    5  # 边框宽度
+                )
+            
+            if current_frame_idx == follow_frame:
+                # 在跟随帧上添加特殊标记
+                cv2.putText(
+                    frame_with_boxes, 
+                    "follow", 
+                    (10, 70),  # 位置 (左上角)
+                    cv2.FONT_HERSHEY_SIMPLEX,  # 字体
+                    1,  # 字体大小
+                    (0, 255, 0),  # 绿色
+                    2,  # 线宽
+                    cv2.LINE_AA  # 抗锯齿
+                )
+                # 添加边框
+                cv2.rectangle(
+                    frame_with_boxes,
+                    (0, 0),
+                    (frame_width-1, frame_height-1),
+                    (0, 255, 0),  # 绿色边框
+                    5  # 边框宽度
+                )
+                        
+            annotated_frames.append(frame_with_boxes)
+        
+        # 保存完整动作视频
+        action_video_path = os.path.join(videos_dir, "tennis_action.mp4")
+        save_video(annotated_frames, action_video_path, fps=30)
+        print(f"完整击球动作视频已保存至: {action_video_path}")
+        
+        # 还可以保存慢动作版本
+        slow_motion_video_path = os.path.join(videos_dir, "tennis_action_slow.mp4")
+        save_video(annotated_frames, slow_motion_video_path, fps=15)  # 半速
+        print(f"慢动作击球视频已保存至: {slow_motion_video_path}")
+        
+        return action_video_path, slow_motion_video_path
 
     # 从这里开始是主要处理逻辑
     #########################################
     # 1. 视频帧提取
     #########################################
-    print("\n步骤1: 从视频中提取帧...")
-    frames_data = extract_frames_and_timestamps(video_path, fps=60)
-    frames_list = [f["frame"] for f in frames_data]
-    print(f"  提取了 {len(frames_list)} 帧")
+    frames_list, actual_fps = extract_part_frames(video_path)
 
     #########################################
     # 2. 网球和球拍检测与跟踪
@@ -1517,21 +1902,36 @@ def process_tennis_video(video_path: str) -> dict:
     print("\n步骤2: 使用目标检测和跟踪模型...")
     with proxy_context():
         # 使用更精确的提示词，专注于运动中、带拖影、模糊的网球
-        tennis_ball_prompt = "moving tennis ball with motion blur"
-        print(f"  使用网球检测提示: '{tennis_ball_prompt}'")
-        ball_tracked = owlv2_sam2_video_tracking(tennis_ball_prompt, frames_list, box_threshold=0.2, chunk_length=15)
+        # 合并三个检测为一次调用
+        combined_prompt = "moving tennis ball with motion blur, tennis racket, tennis player"
+        print(f"  使用合并检测提示: '{combined_prompt}'")
+        combined_tracked = owlv2_sam2_video_tracking(combined_prompt, frames_list, box_threshold=0.2, chunk_length=15)
         
-        # 检查网球拍
-        racket_prompt = "tennis racket"
-        print(f"  使用球拍检测提示: '{racket_prompt}'")
-        racket_tracked = owlv2_sam2_video_tracking(racket_prompt, frames_list, box_threshold=0.3, chunk_length=25)
-
-        # 检查网球运动员
-        player_prompt = "tennis player"
-        print(f"  使用网球运动员检测提示: '{player_prompt}'")
-        player_tracked = owlv2_sam2_video_tracking(player_prompt, frames_list, box_threshold=0.5, chunk_length=25)
-
-    # save_video_with_raw_detections(output_dir, frames_list, ball_tracked, racket_tracked)
+        # 分离检测结果
+        ball_tracked = []
+        racket_tracked = []
+        player_tracked = []
+        
+        for frame_detections in combined_tracked:
+            frame_ball = []
+            frame_racket = []
+            frame_player = []
+            
+            for detection in frame_detections:
+                if "tennis ball" in detection['label'].lower():
+                    frame_ball.append(detection)
+                elif "racket" in detection['label'].lower():
+                    frame_racket.append(detection)
+                elif "player" in detection['label'].lower():
+                    frame_player.append(detection)
+            
+            ball_tracked.append(frame_ball)
+            racket_tracked.append(frame_racket)
+            player_tracked.append(frame_player)
+        
+        print(f"  检测到网球数量: {sum(len(frame) for frame in ball_tracked)}")
+        print(f"  检测到球拍数量: {sum(len(frame) for frame in racket_tracked)}")
+        print(f"  检测到运动员数量: {sum(len(frame) for frame in player_tracked)}")
 
     #########################################
     # 4. 过滤和整理检测结果（逻辑： 仅保留一个网球拍和网球的轨迹）
@@ -1539,50 +1939,61 @@ def process_tennis_video(video_path: str) -> dict:
     player_tracked = filter_player(player_tracked)
     racket_tracked = filter_racket(racket_tracked, player_tracked)
     ball_tracked = filter_tennis_ball(ball_tracked, racket_tracked)
-
-    save_video_with_raw_detections(output_dir, frames_list, ball_tracked, racket_tracked, player_tracked)
+    # save_video_with_raw_detections(output_dir, frames_list, ball_tracked, racket_tracked, player_tracked)
+    save_video_with_filtered_detections(output_dir, frames_list, ball_tracked, racket_tracked, player_tracked)
 
     #########################################
     # 5. 选择最佳接触帧（逻辑： 网球和网球拍最近距离的帧, 可能要考虑网球拍和网球不在同一帧的情况）
     #########################################
-    contact_frame = select_contact_frame(ball_tracked, racket_tracked, player_tracked)
+    contact_frame = select_contact_frame(ball_tracked, racket_tracked, player_tracked, actual_fps)
 
     #########################################
     # 6. 选择准备动作帧（逻辑： 最佳接触帧前，离最佳接触帧最近，网球拍速度最小的帧）
     #########################################
-    prep_frame = select_preparation_frame(contact_frame, ball_tracked, racket_tracked, player_tracked)
+    prep_frame = select_preparation_frame(contact_frame, ball_tracked, racket_tracked, player_tracked, actual_fps)
 
     #########################################
     # 7. 选择完成动作帧（逻辑： 最佳接触帧后, 离最佳接触帧最近，且网球拍位置最高的帧）
     #########################################
-    follow_frame = select_follow_frame(contact_frame, ball_tracked, racket_tracked, player_tracked)
+    follow_frame = select_follow_frame(contact_frame, ball_tracked, racket_tracked, player_tracked, actual_fps)
 
     #########################################
-    # 8. 保存和返回结果
+    # 8. 保存最佳接触帧、准备动作帧、完成动作帧
     #########################################
     print(f"击球帧: {contact_frame}, 准备动作帧: {prep_frame}, 完成动作帧: {follow_frame}")
 
     # 保存最佳接触帧
     contact_frame_path = os.path.join(output_dir, "contact_frame.jpg")
-    cv2.imwrite(contact_frame_path, frames_list[contact_frame])
+    contact_frame_rgb = cv2.cvtColor(frames_list[contact_frame], cv2.COLOR_RGB2BGR)
+    cv2.imwrite(contact_frame_path, contact_frame_rgb)
 
     # 保存准备动作帧
     prep_frame_path = os.path.join(output_dir, "prep_frame.jpg")
-    cv2.imwrite(prep_frame_path, frames_list[prep_frame])
+    prep_frame_rgb = cv2.cvtColor(frames_list[prep_frame], cv2.COLOR_RGB2BGR)
+    cv2.imwrite(prep_frame_path, prep_frame_rgb)
 
     # 保存完成动作帧
     follow_frame_path = os.path.join(output_dir, "follow_frame.jpg")
-    cv2.imwrite(follow_frame_path, frames_list[follow_frame])
+    follow_frame_rgb = cv2.cvtColor(frames_list[follow_frame], cv2.COLOR_RGB2BGR)
+    cv2.imwrite(follow_frame_path, follow_frame_rgb)
 
+    #########################################
+    # 9. 保存最佳接触帧的完整动作的视频
+    #########################################
+    # 获取最佳接触帧的完整动作视频
+    one_action_video_path, slow_action_video_path = save_video_with_one_action(output_dir, frames_list, ball_tracked, racket_tracked, player_tracked,
+                                                                               contact_frame, prep_frame, follow_frame)
 
     # 返回结果字典
     return {
         "preparation_frame": prep_frame_path,
         "contact_frame": contact_frame_path,
         "follow_frame": follow_frame_path,
+        "one_action_video": one_action_video_path,
+        "slow_action_video": slow_action_video_path,
         "output_directory": output_dir
     }
 
 
 # test
-process_tennis_video("./videos/Roger_Federer.mp4")
+process_tennis_video("./videos/Roger_Federer.mp4", "output")
